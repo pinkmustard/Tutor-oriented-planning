@@ -65,10 +65,13 @@ def default_mock_handler(model: str, messages, temperature, max_tokens, stop):
     if "final answer" in text.lower() and "boxed" in text:
         return "After reviewing, the answer is \\boxed{42}."
 
-    if "you are a student" in text and "solve" in text and "independently" in text:
-        return "Let me try. ... The answer is \\boxed{42}."
+    if "conversation with the tutor has now ended" in text:
+        return "Reviewing the conversation... Step 1: ... The answer is \\boxed{42}."
 
-    if "you are a student" in text and "respond" in text:
+    if "solve it yourself" in text or "on your own" in text:
+        return "I'll try. ... The answer is \\boxed{0}."
+
+    if "you are a student in a conversation" in text:
         return "I think I see. Let me try that step again. I get 2x - 3 = 0, so x = 3/2."
 
     if "you are a student" in text:

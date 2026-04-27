@@ -30,10 +30,7 @@ Output strictly in JSON:
 META_TUTOR_AGENDA_USER = """Problem:
 {problem}
 
-Student's initial (incorrect) solution:
-{initial_solution}
-
-Dialogue so far (may be empty):
+Dialogue so far (begins with the student's initial attempt):
 {dialogue}
 
 Current turn index (0-based): {turn_idx}
@@ -83,10 +80,7 @@ Strict rules:
 META_TUTOR_FINAL_USER = """Problem:
 {problem}
 
-Student's initial (incorrect) solution:
-{initial_solution}
-
-Dialogue so far:
+Dialogue so far (begins with the student's initial attempt):
 {dialogue}
 
 Worker outputs (JSON):

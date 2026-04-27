@@ -66,7 +66,6 @@ class MetaTutor:
     def plan_agenda(
         self,
         problem: str,
-        initial_solution: str,
         dialogue: list,
         turn_idx: int,
         max_turns: int,
@@ -75,7 +74,6 @@ class MetaTutor:
             {"role": "system", "content": META_TUTOR_AGENDA_SYSTEM},
             {"role": "user", "content": META_TUTOR_AGENDA_USER.format(
                 problem=problem,
-                initial_solution=initial_solution or "(none)",
                 dialogue=render_dialogue(dialogue) or "(empty)",
                 turn_idx=turn_idx,
                 max_turns=max_turns,
@@ -114,7 +112,6 @@ class MetaTutor:
     def generate_final(
         self,
         problem: str,
-        initial_solution: str,
         dialogue: list,
         worker_outputs: dict,
     ) -> str:
@@ -122,7 +119,6 @@ class MetaTutor:
             {"role": "system", "content": META_TUTOR_FINAL_SYSTEM},
             {"role": "user", "content": META_TUTOR_FINAL_USER.format(
                 problem=problem,
-                initial_solution=initial_solution or "(none)",
                 dialogue=render_dialogue(dialogue) or "(empty)",
                 worker_outputs=json.dumps(
                     {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}

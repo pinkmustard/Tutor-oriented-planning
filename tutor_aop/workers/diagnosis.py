@@ -21,12 +21,11 @@ class DiagnosisWorker:
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-    def run(self, problem: str, initial_solution: str, dialogue: list, subtask: str = "") -> dict:
+    def run(self, problem: str, dialogue: list, subtask: str = "") -> dict:
         messages = [
             {"role": "system", "content": DIAGNOSIS_SYSTEM},
             {"role": "user", "content": DIAGNOSIS_USER.format(
                 problem=problem,
-                initial_solution=initial_solution or "(none)",
                 dialogue=render_dialogue(dialogue) or "(empty)",
             )},
         ]

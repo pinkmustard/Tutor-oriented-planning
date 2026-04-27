@@ -103,7 +103,7 @@ def _normalize_latex(s: str) -> str:
     if s.startswith("(") and s.endswith(")"):
         inner = s[1:-1]
         if inner.count("(") == inner.count(")"):
-            s = inner
+            s = inner.strip()
     return s
 
 
@@ -141,12 +141,31 @@ def answers_equivalent(pred: str, gold: str) -> bool:
 
 
 def render_dialogue(dialogue: list) -> str:
-    """Format a dialogue list [{'role': 'tutor'|'student', 'content': ...}] as text."""
+    """Format a dialogue list [{'role': 'tutor'|'student', 'content': ...}] as text.
+
+    Used by single-shot meta-agents (planner/detector/auditor/workers) that
+    consume a dialogue snapshot as a transcript rather than as chat turns.
+    """
     lines = []
     for m in dialogue:
         role = m.get("role", "?").upper()
         lines.append(f"[{role}] {m.get('content', '')}")
     return "\n".join(lines)
+
+
+def dialogue_as_chat(dialogue: list, self_role: str) -> list:
+    """Render a neutral-role dialogue as chat messages from ``self_role``'s view.
+
+    Messages authored by ``self_role`` become ``assistant``; all others become
+    ``user``. This is the PedagogicalRL-style "perspective rotation" used for
+    real multi-turn chat calls (teacher and student both see themselves as the
+    assistant in their own turns).
+    """
+    msgs = []
+    for d in dialogue:
+        role = "assistant" if d.get("role") == self_role else "user"
+        msgs.append({"role": role, "content": d.get("content", "")})
+    return msgs
 
 
 def contains_end_signal(text: str) -> bool:

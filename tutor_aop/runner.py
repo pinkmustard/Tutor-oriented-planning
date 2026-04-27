@@ -87,7 +87,7 @@ def load_dataset(cfg: dict, mock: bool) -> list:
 
 
 def build_pipeline(cfg: dict):
-    tutor_client, student_client = build_clients_from_config(cfg)
+    tutor_client, student_client, vllm_manager = build_clients_from_config(cfg)
 
     meta_tutor = MetaTutor(
         client=tutor_client,
@@ -107,7 +107,13 @@ def build_pipeline(cfg: dict):
             top_k=cfg["retrieval"].get("top_k", 3),
         )
 
-    student = StudentAgent(client=student_client)
+    exp_cfg = cfg["experiment"]
+    student = StudentAgent(
+        client=student_client,
+        temperature=exp_cfg.get("student_temperature", 0.7),
+        max_tokens=exp_cfg["max_tokens"],
+        resolve_max_tokens=exp_cfg.get("student_resolve_max_tokens"),
+    )
 
     return {
         "tutor_client": tutor_client,
@@ -121,11 +127,12 @@ def build_pipeline(cfg: dict):
             "retrieval": retrieval_w,
         },
         "student": student,
+        "vllm_manager": vllm_manager,
     }
 
 
 def _execute_agenda(agenda: dict, workers: dict, problem: str,
-                    initial_solution: str, dialogue: list) -> dict:
+                    dialogue: list) -> dict:
     """Run workers in order; diagnosis feeds tutor_move & retrieval when present."""
     outputs = {}
     diag = {}
@@ -137,7 +144,7 @@ def _execute_agenda(agenda: dict, workers: dict, problem: str,
             continue
         try:
             if w_name == "diagnosis":
-                out = worker.run(problem, initial_solution, dialogue, subtask=subtask)
+                out = worker.run(problem, dialogue, subtask=subtask)
                 diag = out
             elif w_name == "tutor_move":
                 out = worker.run(problem, diag, dialogue, subtask=subtask)
@@ -212,7 +219,6 @@ def run_episode(problem_row: dict, pipe: dict, cfg: dict) -> dict:
         try:
             agenda = meta_tutor.plan_agenda(
                 problem=problem,
-                initial_solution=initial,
                 dialogue=dialogue,
                 turn_idx=turn_idx,
                 max_turns=max_turns,
@@ -231,7 +237,7 @@ def run_episode(problem_row: dict, pipe: dict, cfg: dict) -> dict:
             turn_log["executed_agenda"] = {k: v for k, v in active_agenda.items() if not k.startswith("_")}
 
             worker_outs = _execute_agenda(
-                active_agenda, workers, problem, initial, dialogue,
+                active_agenda, workers, problem, dialogue,
             )
             turn_log["worker_outputs"] = {
                 k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
@@ -240,7 +246,6 @@ def run_episode(problem_row: dict, pipe: dict, cfg: dict) -> dict:
 
             draft = meta_tutor.generate_final(
                 problem=problem,
-                initial_solution=initial,
                 dialogue=dialogue,
                 worker_outputs=worker_outs,
             )
@@ -275,9 +280,7 @@ def run_episode(problem_row: dict, pipe: dict, cfg: dict) -> dict:
 
             student_resp = student.respond(
                 problem=problem,
-                initial_solution=initial,
                 dialogue=dialogue,
-                tutor_utterance=final_response,
             )
             turn_log["student_response"] = student_resp
             dialogue.append({"role": "student", "content": student_resp})
@@ -337,34 +340,39 @@ def main():
     n_correct_post = 0
     n_tutored = 0
 
-    with open(log_path, "a", encoding="utf-8") as fout:
-        for row in tqdm(data, file=sys.stderr):
-            t0 = time.time()
-            try:
-                episode = run_episode(row, pipe, cfg)
-            except Exception as e:
-                episode = {
-                    "index": row.get("index"),
-                    "problem": row.get("problem"),
-                    "gold_answer": row.get("answer"),
-                    "fatal_error": f"{type(e).__name__}: {e}",
-                    "traceback": traceback.format_exc(),
-                }
-            episode["elapsed_sec"] = round(time.time() - t0, 3)
-            fout.write(json.dumps(episode, ensure_ascii=False) + "\n")
-            fout.flush()
+    try:
+        with open(log_path, "a", encoding="utf-8") as fout:
+            for row in tqdm(data, file=sys.stderr):
+                t0 = time.time()
+                try:
+                    episode = run_episode(row, pipe, cfg)
+                except Exception as e:
+                    episode = {
+                        "index": row.get("index"),
+                        "problem": row.get("problem"),
+                        "gold_answer": row.get("answer"),
+                        "fatal_error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc(),
+                    }
+                episode["elapsed_sec"] = round(time.time() - t0, 3)
+                fout.write(json.dumps(episode, ensure_ascii=False) + "\n")
+                fout.flush()
 
-            if episode.get("initial_grade", {}).get("correct"):
-                n_correct_initial += 1
-            if episode.get("tutoring_needed"):
-                n_tutored += 1
-                if episode.get("post_tutoring_grade", {}).get("correct"):
-                    n_correct_post += 1
+                if episode.get("initial_grade", {}).get("correct"):
+                    n_correct_initial += 1
+                if episode.get("tutoring_needed"):
+                    n_tutored += 1
+                    if episode.get("post_tutoring_grade", {}).get("correct"):
+                        n_correct_post += 1
 
-    total = len(data)
-    print(f"[runner] DONE  total={total}  initial_correct={n_correct_initial}  "
-          f"tutored={n_tutored}  post_tutoring_correct={n_correct_post}",
-          file=sys.stderr)
+        total = len(data)
+        print(f"[runner] DONE  total={total}  initial_correct={n_correct_initial}  "
+              f"tutored={n_tutored}  post_tutoring_correct={n_correct_post}",
+              file=sys.stderr)
+    finally:
+        mgr = pipe.get("vllm_manager")
+        if mgr is not None:
+            mgr.shutdown()
 
 
 if __name__ == "__main__":

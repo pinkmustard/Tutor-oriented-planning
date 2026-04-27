@@ -8,6 +8,18 @@ student_server:
   model: "meta-llama/Llama-3.1-8B-Instruct"
   api_key: "EMPTY"
 
+# Single-GPU mode: the runner auto-launches both vLLM servers with
+# --enable-sleep-mode on the same GPU, and swaps them via /sleep + /wake_up
+# so only one model holds GPU weights at a time. Set enabled: false if you
+# want to manage vLLM processes yourself (e.g., on multi-GPU setups).
+vllm_manager:
+  enabled: true
+  cuda_visible_devices: "1"
+  gpu_memory_utilization: 0.9
+  max_model_len: 16384
+  dtype: "bfloat16"
+  extra_args: []
+
 experiment:
   dataset: "HuggingFaceH4/MATH-500"
   num_problems: 500
@@ -15,13 +27,26 @@ experiment:
   max_turns: 5
   max_replan: 1
   max_revision: 1
-  temperature: 0.0
+  # tutor-side temperature (MetaTutor, Detector, Auditor, Workers, BaselineTutor).
+  temperature: 0.7
+  # student simulator temperature (initial_solve, respond, independent_resolve).
+  student_temperature: 0.6
+  # default max_tokens for most LLM calls.
   max_tokens: 1024
+  # independent_resolve needs room for a full solution after a long dialogue.
+  student_resolve_max_tokens: 2048
+  # vLLM sampling safety net against repetition collapse. 1.0 = off, 1.05-1.15
+  # is a mild damper that keeps temperature sampling from locking into loops.
+  repetition_penalty: 1.05
   request_timeout: 120
   retry: 5
+  # Thread-pool width for batched stages (baseline_runner). vLLM batches
+  # concurrent requests server-side; this caps how many inflight requests we
+  # submit per stage. Keep <= vLLM max_num_seqs to avoid unnecessary queueing.
+  concurrency: 32
 
 retrieval:
-  pool_path: "rag_pool/proofwiki_examples.jsonl"
+  pool_path: "rag_pool/rag_pool.jsonl"
   top_k: 3
   enabled: true
 

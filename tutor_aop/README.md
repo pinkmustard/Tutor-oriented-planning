@@ -26,34 +26,56 @@ Tutor moves: `Focus` / `Probing` / `Telling` / `Generic`.
 pip install -r tutor_aop/requirements.txt
 ```
 
-## Launch vLLM servers (two, V100-friendly)
+## Single-GPU vLLM management (default)
+
+With `vllm_manager.enabled: true` in `config.yaml`, the runner auto-launches
+both tutor and student vLLM servers on the same GPU with `--enable-sleep-mode`
+and swaps them via `/sleep` + `/wake_up` so only one model holds GPU weights
+at a time. No manual vLLM startup is needed — just run:
 
 ```bash
-# Tutor server (all agents use this model)
+python -m tutor_aop.runner --config tutor_aop/config.yaml
+```
+
+Startup sequence per run: tutor server boots → sleeps → student server boots
+→ sleeps → episodes begin, waking the active role on demand. Wake/sleep takes
+~1–2s per swap (CPU↔GPU weight copy). Requires vLLM ≥ 0.6.4 and enough CPU
+RAM to hold both model weights simultaneously (~28 GB for two 7–8B fp16 models).
+
+Tune in `config.yaml`:
+
+- `vllm_manager.cuda_visible_devices` — which GPU to use (default `"0"`).
+- `vllm_manager.gpu_memory_utilization` — fraction of total VRAM each server
+  may use when awake. `0.45` is safe on a 48 GB A6000 for two 7–8B models.
+  Bump higher if you only ever wake one at a time *and* startup allocation
+  profiling still succeeds; lower if you see OOM during boot.
+- `vllm_manager.dtype` — `float16` or `bfloat16`. A6000/Ampere supports both.
+- `vllm_manager.extra_args` — passed through to each vLLM process
+  (e.g. `["--trust-remote-code"]`).
+
+### Multi-GPU setup (fallback)
+
+Set `vllm_manager.enabled: false` and launch the two servers manually on
+separate GPUs as before:
+
+```bash
 CUDA_VISIBLE_DEVICES=0 \
 python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-7B-Instruct \
-    --dtype float16 \
-    --port 8000 \
-    --max-model-len 8192
+    --dtype float16 --port 8000 --max-model-len 8192
 
-# Student server
 CUDA_VISIBLE_DEVICES=1 \
 python -m vllm.entrypoints.openai.api_server \
     --model meta-llama/Llama-3.1-8B-Instruct \
-    --dtype float16 \
-    --port 8001 \
-    --max-model-len 8192
+    --dtype float16 --port 8001 --max-model-len 8192
 ```
-
-`--dtype float16` is mandatory on V100 (no bf16 support).
 
 ## Run the experiment
 
 ```bash
 cd /raid/nlpdrkim/song-workspace/tutor/kcc2026/Tutor-oriented-planning
 
-# Live run (requires both vLLM servers up)
+# Live run (single-GPU default — the runner spawns vLLM itself)
 python -m tutor_aop.runner --config tutor_aop/config.yaml
 
 # Smaller slice

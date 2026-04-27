@@ -20,6 +20,10 @@ class LLMClient:
         retries: int = 5,
         mock: bool = False,
         mock_handler=None,
+        manager=None,
+        role: Optional[str] = None,
+        repetition_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
     ):
         self.base_url = base_url
         self.model = model
@@ -28,6 +32,10 @@ class LLMClient:
         self.retries = retries
         self.mock = mock
         self.mock_handler = mock_handler
+        self.manager = manager
+        self.role = role
+        self.repetition_penalty = repetition_penalty
+        self.seed = seed
         self._client = None
 
         if not mock:
@@ -48,6 +56,17 @@ class LLMClient:
         if self.mock:
             return self._mock_call(messages, temperature, max_tokens, stop)
 
+        if self.manager is not None and self.role is not None:
+            self.manager.ensure_active(self.role)
+
+        # vLLM-specific sampling params go through extra_body (OpenAI schema
+        # doesn't define repetition_penalty / seed-on-generation).
+        extra_body: Dict = {}
+        if self.repetition_penalty is not None:
+            extra_body["repetition_penalty"] = self.repetition_penalty
+        if self.seed is not None:
+            extra_body["seed"] = self.seed
+
         last_err = None
         for attempt in range(self.retries):
             try:
@@ -57,6 +76,7 @@ class LLMClient:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     stop=stop,
+                    extra_body=extra_body or None,
                 )
                 content = resp.choices[0].message.content
                 if content is None:
@@ -75,16 +95,30 @@ class LLMClient:
 
 
 def build_clients_from_config(cfg: dict):
-    """Build tutor and student clients from a config dict."""
+    """Build tutor and student clients from a config dict.
+
+    Returns (tutor_client, student_client, vllm_manager). `vllm_manager` is
+    `None` in mock mode or when single-GPU sleep/wake management is disabled.
+    """
     mock_enabled = cfg.get("mock", {}).get("enabled", False)
     mock_handler = None
     if mock_enabled:
         from .mock_backend import default_mock_handler
         mock_handler = default_mock_handler
 
+    manager = None
+    if not mock_enabled:
+        from .vllm_manager import build_manager_from_config
+        manager = build_manager_from_config(cfg)
+        if manager is not None:
+            manager.startup()
+
     exp = cfg["experiment"]
     tutor_cfg = cfg["tutor_server"]
     student_cfg = cfg["student_server"]
+
+    rep_penalty = exp.get("repetition_penalty")
+    seed = exp.get("seed")
 
     tutor = LLMClient(
         base_url=tutor_cfg["base_url"],
@@ -94,6 +128,10 @@ def build_clients_from_config(cfg: dict):
         retries=exp.get("retry", 5),
         mock=mock_enabled,
         mock_handler=mock_handler,
+        manager=manager,
+        role="tutor",
+        repetition_penalty=rep_penalty,
+        seed=seed,
     )
     student = LLMClient(
         base_url=student_cfg["base_url"],
@@ -103,5 +141,9 @@ def build_clients_from_config(cfg: dict):
         retries=exp.get("retry", 5),
         mock=mock_enabled,
         mock_handler=mock_handler,
+        manager=manager,
+        role="student",
+        repetition_penalty=rep_penalty,
+        seed=seed,
     )
-    return tutor, student
+    return tutor, student, manager

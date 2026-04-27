@@ -1,6 +1,6 @@
 """Prompts for workers: Diagnosis, Tutor Move Selector, Retrieval query formulation."""
 
-DIAGNOSIS_SYSTEM = """You are the Diagnosis Worker in a math tutoring system. Given the problem, the student's initial (incorrect) solution, and the dialogue so far, identify the student's FIRST error step and characterize it.
+DIAGNOSIS_SYSTEM = """You are the Diagnosis Worker in a math tutoring system. Given the problem and the dialogue so far (which begins with the student's initial attempt), identify the student's FIRST error step and characterize it.
 
 Be concise and concrete. Quote the earliest wrong mathematical step verbatim when possible.
 
@@ -18,10 +18,7 @@ Output strictly JSON:
 DIAGNOSIS_USER = """Problem:
 {problem}
 
-Student's initial (incorrect) solution:
-{initial_solution}
-
-Dialogue so far:
+Dialogue so far (begins with the student's initial attempt):
 {dialogue}
 
 Produce the diagnosis JSON."""
