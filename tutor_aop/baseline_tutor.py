@@ -2,14 +2,20 @@
 
 One LLM call per turn. The system prompt carries only the problem; the
 student's initial attempt is the first ``user`` message in the dialogue chat
-(student -> "user", tutor -> "assistant") so the model can follow the flow
-without seeing the initial attempt twice.
+(student -> "user", tutor -> "assistant"). After the perspective-rotated
+dialogue we append an explicit user-role nudge instructing the model to
+produce its next short utterance -- mirrors the "now do X" pattern that
+initial_solve / independent_resolve already use, and keeps the brevity
+constraint visible at the end of the prompt where attention concentrates.
 """
 from __future__ import annotations
 
 from typing import List, Dict
 
-from .prompts.baseline_tutor_prompts import BASELINE_TUTOR_SYSTEM
+from .prompts.baseline_tutor_prompts import (
+    BASELINE_TUTOR_SYSTEM,
+    BASELINE_TUTOR_RESPOND_NUDGE,
+)
 
 
 class BaselineTutor:
@@ -17,11 +23,13 @@ class BaselineTutor:
         self,
         client,
         system_prompt: str = BASELINE_TUTOR_SYSTEM,
-        temperature: float = 0.0,
+        respond_nudge: str = BASELINE_TUTOR_RESPOND_NUDGE,
+        temperature: float = 1.0,
         max_tokens: int = 1024,
     ):
         self.client = client
         self.system_prompt = system_prompt
+        self.respond_nudge = respond_nudge
         self.temperature = temperature
         self.max_tokens = max_tokens
 
@@ -44,6 +52,8 @@ class BaselineTutor:
                 messages.append({"role": "user", "content": content})
             elif role == "tutor":
                 messages.append({"role": "assistant", "content": content})
+        # Final user-role nudge -- "now write your next utterance"
+        messages.append({"role": "user", "content": self.respond_nudge})
         out = self.client.chat(
             messages,
             temperature=self.temperature,

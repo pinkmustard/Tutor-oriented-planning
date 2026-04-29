@@ -2,9 +2,16 @@
 
 Supports two separate endpoints (tutor, student) and a mock mode for
 dry-run testing without live servers.
+
+A tutor "client" may be a single ``LLMClient`` (one vLLM endpoint) or a
+``RoundRobinLLMClient`` that fans calls across multiple vLLM replicas of the
+same model on different GPUs. Used by AOP to split the per-turn 7-call burst
+(plan/detect/replan/workers/final/audit/revise) across two tutor GPUs.
 """
 from __future__ import annotations
 
+import itertools
+import threading
 import time
 import random
 from typing import List, Dict, Optional
@@ -94,6 +101,49 @@ class LLMClient:
         return "OK"
 
 
+class RoundRobinLLMClient:
+    """Routes each ``chat`` call to the next ``LLMClient`` in a thread-safe
+    round-robin. All wrapped clients must point at the same model (typically
+    multiple vLLM replicas of the same checkpoint on different GPUs)."""
+
+    def __init__(self, clients: List[LLMClient]):
+        if not clients:
+            raise ValueError("RoundRobinLLMClient requires at least one client")
+        self._clients = list(clients)
+        self._counter = itertools.count()
+        self._lock = threading.Lock()
+        # Expose .model so callers reading the model name still work.
+        self.model = self._clients[0].model
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        stop: Optional[List[str]] = None,
+    ) -> str:
+        with self._lock:
+            i = next(self._counter) % len(self._clients)
+        return self._clients[i].chat(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stop=stop,
+        )
+
+
+def _tutor_base_urls(tutor_cfg: dict) -> List[str]:
+    urls = tutor_cfg.get("base_urls")
+    if urls:
+        if not isinstance(urls, list) or not urls:
+            raise ValueError("tutor_server.base_urls must be a non-empty list")
+        return list(urls)
+    single = tutor_cfg.get("base_url")
+    if not single:
+        raise ValueError("tutor_server: provide either base_urls (list) or base_url (str)")
+    return [single]
+
+
 def build_clients_from_config(cfg: dict):
     """Build tutor and student clients from a config dict.
 
@@ -120,19 +170,25 @@ def build_clients_from_config(cfg: dict):
     rep_penalty = exp.get("repetition_penalty")
     seed = exp.get("seed")
 
-    tutor = LLMClient(
-        base_url=tutor_cfg["base_url"],
-        model=tutor_cfg["model"],
-        api_key=tutor_cfg.get("api_key", "EMPTY"),
-        timeout=exp.get("request_timeout", 120),
-        retries=exp.get("retry", 5),
-        mock=mock_enabled,
-        mock_handler=mock_handler,
-        manager=manager,
-        role="tutor",
-        repetition_penalty=rep_penalty,
-        seed=seed,
-    )
+    tutor_urls = _tutor_base_urls(tutor_cfg)
+    tutor_replicas = [
+        LLMClient(
+            base_url=url,
+            model=tutor_cfg["model"],
+            api_key=tutor_cfg.get("api_key", "EMPTY"),
+            timeout=exp.get("request_timeout", 120),
+            retries=exp.get("retry", 5),
+            mock=mock_enabled,
+            mock_handler=mock_handler,
+            manager=manager,
+            role="tutor",
+            repetition_penalty=rep_penalty,
+            seed=seed,
+        )
+        for url in tutor_urls
+    ]
+    tutor = tutor_replicas[0] if len(tutor_replicas) == 1 else RoundRobinLLMClient(tutor_replicas)
+
     student = LLMClient(
         base_url=student_cfg["base_url"],
         model=student_cfg["model"],

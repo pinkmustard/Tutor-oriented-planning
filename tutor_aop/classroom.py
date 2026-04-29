@@ -18,16 +18,42 @@ shrinks naturally turn-over-turn.
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 import traceback as _tb
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .evaluator import grade
 from .utils import contains_end_signal
+
+
+def load_fixed_initials(path: str) -> Dict[int, str]:
+    """Load precomputed student initial solutions keyed by problem index.
+
+    Expected file format: a JSON list of dicts with at least ``idx`` (the
+    dataset row index) and ``raw_output`` (the full text of the student's
+    initial solution). Used to fix the initial-solution distribution across
+    tutor-model swaps so post-tutoring accuracy comparisons are apples-to-
+    apples instead of confounded by per-run student stochasticity.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(
+            f"fixed_initial_solutions {path!r} must be a JSON list, got {type(data).__name__}"
+        )
+    out: Dict[int, str] = {}
+    for i, item in enumerate(data):
+        if "idx" not in item or "raw_output" not in item:
+            raise ValueError(
+                f"fixed_initial_solutions[{i}] missing 'idx' or 'raw_output' keys"
+            )
+        out[int(item["idx"])] = item["raw_output"]
+    return out
 
 
 class ConvState(Enum):
@@ -102,6 +128,7 @@ def run_baseline_batch(
     tutor,
     student,
     cfg: dict,
+    fixed_initials: Optional[Dict[int, str]] = None,
 ) -> List[BaselineConv]:
     """Run the whole baseline experiment as stage-wise batched calls.
 
@@ -133,31 +160,59 @@ def run_baseline_batch(
 
     # --- Stage 1: initial_solve -------------------------------------------
     active_initial = [c for c in convs if c.state == ConvState.STUDENT_INITIAL]
-    _log(f"initial_solve: {len(active_initial)} problems (concurrency={concurrency})")
-    t0 = time.time()
-    results = _run_parallel(
-        lambda c: student.initial_solve(c.row["problem"]),
-        active_initial,
-        concurrency,
-    )
-    for c, (out, err) in zip(active_initial, results):
-        if err is not None:
-            c.fatal_error = f"{err[0]}: {err[1]}"
-            c.fatal_traceback = err[2]
-            c.state = ConvState.END
-            c.ended_by = "fatal_error_initial"
-            continue
-        c.initial_solution = out
-        c.initial_grade = grade(out, c.row.get("answer", ""))
-        if c.initial_grade.get("correct"):
-            c.state = ConvState.END
-            c.ended_by = "skip_correct_initial"
-        else:
-            c.tutoring_needed = True
-            c.dialogue = [{"role": "student", "content": out}]
-            c.state = ConvState.TUTOR_TURN
-    _log(f"initial_solve done in {time.time() - t0:.1f}s; "
-         f"tutoring_needed={sum(c.tutoring_needed for c in convs)}")
+
+    if fixed_initials is not None:
+        # Look up precomputed initial solutions by row index. No LLM call.
+        _log(f"initial_solve (fixed): looking up {len(active_initial)} problems")
+        t0 = time.time()
+        for c in active_initial:
+            idx = c.row.get("index")
+            if idx is None or idx not in fixed_initials:
+                c.fatal_error = (
+                    f"fixed_initial_solutions has no entry for idx={idx!r}"
+                )
+                c.fatal_traceback = ""
+                c.state = ConvState.END
+                c.ended_by = "fatal_error_initial"
+                continue
+            out = fixed_initials[idx]
+            c.initial_solution = out
+            c.initial_grade = grade(out, c.row.get("answer", ""))
+            if c.initial_grade.get("correct"):
+                c.state = ConvState.END
+                c.ended_by = "skip_correct_initial"
+            else:
+                c.tutoring_needed = True
+                c.dialogue = [{"role": "student", "content": out}]
+                c.state = ConvState.TUTOR_TURN
+        _log(f"initial_solve (fixed) done in {time.time() - t0:.2f}s; "
+             f"tutoring_needed={sum(c.tutoring_needed for c in convs)}")
+    else:
+        _log(f"initial_solve: {len(active_initial)} problems (concurrency={concurrency})")
+        t0 = time.time()
+        results = _run_parallel(
+            lambda c: student.initial_solve(c.row["problem"]),
+            active_initial,
+            concurrency,
+        )
+        for c, (out, err) in zip(active_initial, results):
+            if err is not None:
+                c.fatal_error = f"{err[0]}: {err[1]}"
+                c.fatal_traceback = err[2]
+                c.state = ConvState.END
+                c.ended_by = "fatal_error_initial"
+                continue
+            c.initial_solution = out
+            c.initial_grade = grade(out, c.row.get("answer", ""))
+            if c.initial_grade.get("correct"):
+                c.state = ConvState.END
+                c.ended_by = "skip_correct_initial"
+            else:
+                c.tutoring_needed = True
+                c.dialogue = [{"role": "student", "content": out}]
+                c.state = ConvState.TUTOR_TURN
+        _log(f"initial_solve done in {time.time() - t0:.1f}s; "
+             f"tutoring_needed={sum(c.tutoring_needed for c in convs)}")
 
     # --- Stage 2: multi-turn loop -----------------------------------------
     for turn_idx in range(max_turns):

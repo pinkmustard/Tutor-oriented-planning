@@ -1,27 +1,36 @@
 tutor_server:
-  base_url: "http://localhost:8000/v1"
-  model: "Qwen/Qwen2.5-7B-Instruct"
+  # Single tutor instance on the external 96GB GPU. With ~80GB free for KV
+  # cache after 4B weights, we run vLLM with --max-num-seqs 256 so all 100
+  # problems in a stage land in one continuous batch -- no need for multiple
+  # replicas. (RoundRobinLLMClient automatically degenerates to a plain
+  # LLMClient when base_urls has a single entry.)
+  # The list form is kept for forward compatibility; a plain `base_url: "..."`
+  # is also accepted.
+  base_urls:
+    - "http://127.0.0.1:9000/v1"   # external 96GB GPU
+  model: "Qwen/Qwen3-4B-Instruct-2507" # "Qwen/Qwen2.5-7B-Instruct"
   api_key: "EMPTY"
 
 student_server:
-  base_url: "http://localhost:8001/v1"
+  base_url: "http://localhost:8001/v1"   # local A6000 48GB (GPU 1)
   model: "meta-llama/Llama-3.1-8B-Instruct"
   api_key: "EMPTY"
 
-# Single-GPU mode: the runner auto-launches both vLLM servers with
-# --enable-sleep-mode on the same GPU, and swaps them via /sleep + /wake_up
-# so only one model holds GPU weights at a time. Set enabled: false if you
-# want to manage vLLM processes yourself (e.g., on multi-GPU setups).
+# Multi-GPU mode: tutor on external 96GB + student on local A6000.
+# vLLM servers are launched manually by the user; no sleep/wake swap needed.
+# Set enabled: true only for the legacy single-GPU sleep/wake setup.
 vllm_manager:
-  enabled: true
+  enabled: false
   cuda_visible_devices: "1"
   gpu_memory_utilization: 0.9
   max_model_len: 16384
   dtype: "bfloat16"
   extra_args: []
-
 experiment:
-  dataset: "HuggingFaceH4/MATH-500"
+  dataset: "HuggingFaceH4/MATH-500" #"rd211/Big-Math-RL-Verified-Filtered"
+  # HF split to load. MATH-500 only has "test"; rd211/Big-Math-RL-Verified-
+  # Filtered also exposes "test". Override with --dataset-split when needed.
+  dataset_split: "test"
   num_problems: 500
   start_index: 0
   max_turns: 5
@@ -31,19 +40,35 @@ experiment:
   temperature: 0.7
   # student simulator temperature (initial_solve, respond, independent_resolve).
   student_temperature: 0.6
-  # default max_tokens for most LLM calls.
+  # AOP control-flow LLM calls (Meta-Tutor agenda/replan/revise, Detector,
+  # Auditor, Workers). JSON outputs need headroom so kept at 1024.
   max_tokens: 1024
-  # independent_resolve needs room for a full solution after a long dialogue.
-  student_resolve_max_tokens: 2048
+  # Per-stage caps used by baseline + AOP student. Mid-dialogue turns are
+  # tightened hard because long mid-turns drive multi-turn quality collapse
+  # (output runs into max cap, \boxed gets truncated, prior-turn context
+  # accumulates noise). MATH-500 reference solutions are p75=271 tokens, so
+  # 1024 is plenty for initial_solve / independent_resolve.
+  student_initial_max_tokens: 1024
+  student_respond_max_tokens: 320
+  student_resolve_max_tokens: 1024
+  tutor_turn_max_tokens: 320
   # vLLM sampling safety net against repetition collapse. 1.0 = off, 1.05-1.15
   # is a mild damper that keeps temperature sampling from locking into loops.
-  repetition_penalty: 1.05
+  repetition_penalty: 1.0
   request_timeout: 120
   retry: 5
   # Thread-pool width for batched stages (baseline_runner). vLLM batches
   # concurrent requests server-side; this caps how many inflight requests we
   # submit per stage. Keep <= vLLM max_num_seqs to avoid unnecessary queueing.
   concurrency: 32
+  # Path (relative to tutor_aop/) to a JSON list of precomputed student
+  # initial solutions, format [{"idx": <int>, "raw_output": <str>, ...}, ...].
+  # If set, student.initial_solve is skipped entirely and dialogue[0] for each
+  # problem is taken from this file (matched by dataset row index). Use this
+  # to fix the initial-solution distribution when comparing tutor models, so
+  # post-tutoring accuracy differences are not confounded by per-run student
+  # stochasticity. Set to null to fall back to live initial_solve generation.
+  fixed_initial_solutions: "math500_init_result.json" # "bigmath_init_result.json"
 
 retrieval:
   pool_path: "rag_pool/rag_pool.jsonl"

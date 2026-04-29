@@ -172,3 +172,18 @@ def contains_end_signal(text: str) -> bool:
     if text is None:
         return False
     return "<end_of_conversation>" in text.lower() or "<end_of_conversation>" in text
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+
+
+def strip_thinking(text: str) -> str:
+    """Remove ``<think>...</think>`` blocks (PedagogicalRL convention).
+
+    Used when rotating dialogue into the student's perspective so the student
+    model never sees the tutor's hidden reasoning. No-op for content without
+    ``<think>`` tags, so safe to apply unconditionally on the rotation path.
+    """
+    if text is None:
+        return ""
+    return _THINK_RE.sub("", text).strip()

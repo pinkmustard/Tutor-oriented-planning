@@ -1,12 +1,26 @@
-"""Orchestrator for the detector-guided, AOP-inspired tutoring pipeline.
+"""AOP runner: stage-wise batched detector-guided pipeline across the whole
+problem set, with the same shape as ``baseline_runner`` (one batch call,
+results streamed to JSONL at the end).
 
-Per problem, runs:
-  1. Student initial solve (skip if already correct).
-  2. Multi-turn tutoring:
-       Meta-Tutor.agenda -> Detector -> (Replan x1) -> Workers ->
-       Meta-Tutor.final  -> Auditor  -> (Revision x1) -> Student.respond
-  3. Student independent re-solve using the dialogue transcript.
-  4. Logging (one JSONL row per episode).
+Per turn the pipeline unfolds into ~9 sub-stages -- see ``aop_classroom`` for
+the full state diagram:
+
+    Student.initial_solve (N problems)              -- batch on student server
+    Loop turn 1..max_turns:
+        Meta-Tutor.plan_agenda                      -- batch on tutor servers (RR)
+        Detector.detect                             -- batch on tutor servers
+        [Meta-Tutor.replan]   (subset)              -- batch on tutor servers
+        DiagnosisWorker / TutorMoveWorker /
+            RetrievalWorker  (per-agenda subsets)   -- batches on tutor servers
+        Meta-Tutor.generate_final                   -- batch on tutor servers
+        Auditor.audit                               -- batch on tutor servers
+        [Meta-Tutor.revise_final] (subset)          -- batch on tutor servers
+        Student.respond  (active subset)            -- batch on student server
+    Student.independent_resolve (all tutored)       -- batch on student server
+
+vLLM continuous-batching packs each stage's concurrent requests server-side.
+With multiple tutor replicas behind a ``RoundRobinLLMClient``, the per-turn
+~7-call burst is split across GPUs.
 """
 from __future__ import annotations
 
@@ -15,11 +29,8 @@ import json
 import os
 import sys
 import time
-import traceback
-from typing import Optional
 
 import yaml
-from tqdm import tqdm
 
 from .llm_client import build_clients_from_config
 from .meta_tutor import MetaTutor
@@ -27,8 +38,8 @@ from .detector import PlanDetector
 from .auditor import PedagogicalAuditor
 from .student import StudentAgent
 from .workers import DiagnosisWorker, TutorMoveWorker, RetrievalWorker
-from .evaluator import grade
-from .utils import contains_end_signal, extract_boxed
+from .classroom import load_fixed_initials
+from .aop_classroom import run_aop_batch, aop_conv_to_log_row
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,11 +54,17 @@ def load_config(path: str) -> dict:
     log_dir = cfg.get("logging", {}).get("log_dir", "logs")
     if log_dir and not os.path.isabs(log_dir):
         cfg["logging"]["log_dir"] = os.path.join(HERE, log_dir)
+    fixed = cfg.get("experiment", {}).get("fixed_initial_solutions")
+    if fixed and not os.path.isabs(fixed):
+        cfg["experiment"]["fixed_initial_solutions"] = os.path.join(HERE, fixed)
     return cfg
 
 
 def load_dataset(cfg: dict, mock: bool) -> list:
+    """Load problems from the configured HF dataset/split. See baseline_runner
+    for field-map notes (Big-Math has no solution/level/subject)."""
     name = cfg["experiment"]["dataset"]
+    split = cfg["experiment"].get("dataset_split", "test")
     num = cfg["experiment"]["num_problems"]
     start = cfg["experiment"].get("start_index", 0)
 
@@ -59,6 +76,7 @@ def load_dataset(cfg: dict, mock: bool) -> list:
                 "answer": "3",
                 "level": "Level 1",
                 "subject": "Algebra",
+                "index": 0,
             },
             {
                 "problem": "Find the area of a right triangle with legs 3 and 4.",
@@ -66,11 +84,12 @@ def load_dataset(cfg: dict, mock: bool) -> list:
                 "answer": "6",
                 "level": "Level 1",
                 "subject": "Geometry",
+                "index": 1,
             },
         ][:max(1, num)]
 
     from datasets import load_dataset as hf_load_dataset
-    ds = hf_load_dataset(name, split="test")
+    ds = hf_load_dataset(name, split=split)
     end = min(start + num, len(ds))
     out = []
     for i in range(start, end):
@@ -81,6 +100,8 @@ def load_dataset(cfg: dict, mock: bool) -> list:
             "answer": row.get("answer"),
             "level": row.get("level"),
             "subject": row.get("subject"),
+            "source": row.get("source"),
+            "domain": row.get("domain"),
             "index": i,
         })
     return out
@@ -93,6 +114,7 @@ def build_pipeline(cfg: dict):
         client=tutor_client,
         temperature=cfg["experiment"]["temperature"],
         max_tokens=cfg["experiment"]["max_tokens"],
+        tutor_turn_max_tokens=cfg["experiment"]["tutor_turn_max_tokens"],
     )
     detector = PlanDetector(client=tutor_client)
     auditor = PedagogicalAuditor(client=tutor_client)
@@ -111,8 +133,9 @@ def build_pipeline(cfg: dict):
     student = StudentAgent(
         client=student_client,
         temperature=exp_cfg.get("student_temperature", 0.7),
-        max_tokens=exp_cfg["max_tokens"],
-        resolve_max_tokens=exp_cfg.get("student_resolve_max_tokens"),
+        initial_max_tokens=exp_cfg["student_initial_max_tokens"],
+        respond_max_tokens=exp_cfg["student_respond_max_tokens"],
+        resolve_max_tokens=exp_cfg["student_resolve_max_tokens"],
     )
 
     return {
@@ -131,191 +154,36 @@ def build_pipeline(cfg: dict):
     }
 
 
-def _execute_agenda(agenda: dict, workers: dict, problem: str,
-                    dialogue: list) -> dict:
-    """Run workers in order; diagnosis feeds tutor_move & retrieval when present."""
-    outputs = {}
-    diag = {}
-    for item in agenda.get("agenda", []):
-        w_name = item.get("worker")
-        subtask = item.get("task", "")
-        worker = workers.get(w_name)
-        if worker is None:
-            continue
-        try:
-            if w_name == "diagnosis":
-                out = worker.run(problem, dialogue, subtask=subtask)
-                diag = out
-            elif w_name == "tutor_move":
-                out = worker.run(problem, diag, dialogue, subtask=subtask)
-            elif w_name == "retrieval":
-                out = worker.run(problem, diag, dialogue, subtask=subtask)
-            else:
-                continue
-            outputs.setdefault(w_name, out)
-        except Exception as e:
-            outputs[w_name] = {"error": f"{type(e).__name__}: {e}"}
-    return outputs
-
-
-def run_episode(problem_row: dict, pipe: dict, cfg: dict) -> dict:
-    exp = cfg["experiment"]
-    max_turns = exp["max_turns"]
-    max_replan = exp["max_replan"]
-    max_revision = exp["max_revision"]
-
-    problem = problem_row["problem"]
-    gold = problem_row["answer"]
-
-    meta_tutor = pipe["meta_tutor"]
-    detector = pipe["detector"]
-    auditor = pipe["auditor"]
-    workers = pipe["workers"]
-    student = pipe["student"]
-
-    episode = {
-        "index": problem_row.get("index"),
-        "problem": problem,
-        "gold_answer": gold,
-        "level": problem_row.get("level"),
-        "subject": problem_row.get("subject"),
-        "initial_solution": None,
-        "initial_grade": None,
-        "tutoring_needed": False,
-        "turns": [],
-        "ended_by": None,
-        "post_tutoring_solution": None,
-        "post_tutoring_grade": None,
-    }
-
-    initial = student.initial_solve(problem)
-    episode["initial_solution"] = initial
-    episode["initial_grade"] = grade(initial, gold)
-
-    if episode["initial_grade"]["correct"]:
-        episode["ended_by"] = "skip_correct_initial"
-        return episode
-
-    episode["tutoring_needed"] = True
-
-    dialogue = [{"role": "student", "content": initial}]
-
-    for turn_idx in range(max_turns):
-        turn_log = {
-            "turn_idx": turn_idx,
-            "initial_agenda": None,
-            "detector_output": None,
-            "replan_agenda": None,
-            "executed_agenda": None,
-            "worker_outputs": None,
-            "draft_response": None,
-            "auditor_output": None,
-            "revised_response": None,
-            "final_tutor_response": None,
-            "student_response": None,
-            "errors": [],
-        }
-
-        try:
-            agenda = meta_tutor.plan_agenda(
-                problem=problem,
-                dialogue=dialogue,
-                turn_idx=turn_idx,
-                max_turns=max_turns,
-            )
-            turn_log["initial_agenda"] = {k: v for k, v in agenda.items() if not k.startswith("_")}
-
-            det = detector.detect(problem, agenda, turn_idx, max_turns)
-            turn_log["detector_output"] = {k: v for k, v in det.items() if not k.startswith("_")}
-
-            active_agenda = agenda
-            if detector.needs_replan(det) and max_replan > 0:
-                new_agenda = meta_tutor.replan(problem, agenda, det, dialogue)
-                turn_log["replan_agenda"] = {k: v for k, v in new_agenda.items() if not k.startswith("_")}
-                active_agenda = new_agenda
-
-            turn_log["executed_agenda"] = {k: v for k, v in active_agenda.items() if not k.startswith("_")}
-
-            worker_outs = _execute_agenda(
-                active_agenda, workers, problem, dialogue,
-            )
-            turn_log["worker_outputs"] = {
-                k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
-                for k, v in worker_outs.items()
-            }
-
-            draft = meta_tutor.generate_final(
-                problem=problem,
-                dialogue=dialogue,
-                worker_outputs=worker_outs,
-            )
-            turn_log["draft_response"] = draft
-
-            tutor_move_str = ""
-            if "tutor_move" in worker_outs:
-                tutor_move_str = worker_outs["tutor_move"].get("selected_move", "")
-
-            audit = auditor.audit(problem, draft, tutor_move=tutor_move_str)
-            turn_log["auditor_output"] = {k: v for k, v in audit.items() if not k.startswith("_")}
-
-            final_response = draft
-            if auditor.needs_revision(audit) and max_revision > 0:
-                revised = meta_tutor.revise_final(
-                    problem=problem,
-                    dialogue=dialogue,
-                    worker_outputs=worker_outs,
-                    draft=draft,
-                    auditor_feedback=audit,
-                )
-                turn_log["revised_response"] = revised
-                final_response = revised
-
-            turn_log["final_tutor_response"] = final_response
-            dialogue.append({"role": "tutor", "content": final_response})
-
-            if contains_end_signal(final_response):
-                episode["turns"].append(turn_log)
-                episode["ended_by"] = "end_token"
-                break
-
-            student_resp = student.respond(
-                problem=problem,
-                dialogue=dialogue,
-            )
-            turn_log["student_response"] = student_resp
-            dialogue.append({"role": "student", "content": student_resp})
-
-            episode["turns"].append(turn_log)
-
-        except Exception as e:
-            turn_log["errors"].append(f"{type(e).__name__}: {e}")
-            turn_log["errors"].append(traceback.format_exc())
-            episode["turns"].append(turn_log)
-            episode["ended_by"] = f"error_in_turn_{turn_idx}"
-            break
-
-    if episode["ended_by"] is None:
-        episode["ended_by"] = "max_turns"
-
-    try:
-        post = student.independent_resolve(problem, dialogue)
-        episode["post_tutoring_solution"] = post
-        episode["post_tutoring_grade"] = grade(post, gold)
-    except Exception as e:
-        episode["post_tutoring_solution"] = None
-        episode["post_tutoring_grade"] = {"correct": False, "reason": f"{type(e).__name__}: {e}"}
-
-    episode["dialogue"] = dialogue
-    return episode
+def _slugify_model(name: str) -> str:
+    return name.replace("/", "_").replace(":", "_")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=os.path.join(HERE, "config.yaml"))
-    ap.add_argument("--mock", action="store_true", help="Run with deterministic mock backend (no vLLM).")
-    ap.add_argument("--num", type=int, default=None, help="Override experiment.num_problems.")
-    ap.add_argument("--start", type=int, default=None, help="Override experiment.start_index.")
-    ap.add_argument("--out", type=str, default=None, help="Override log file path.")
+    ap.add_argument("--mock", action="store_true",
+                    help="Run with deterministic mock backend (no vLLM).")
+    ap.add_argument("--num", type=int, default=None,
+                    help="Override experiment.num_problems.")
+    ap.add_argument("--start", type=int, default=None,
+                    help="Override experiment.start_index.")
+    ap.add_argument("--tutor-model", type=str, default=None,
+                    help="Override tutor_server.model.")
+    ap.add_argument("--student-model", type=str, default=None,
+                    help="Override student_server.model.")
+    ap.add_argument("--dataset", type=str, default=None,
+                    help="Override experiment.dataset (HF dataset name).")
+    ap.add_argument("--dataset-split", type=str, default=None,
+                    help="Override experiment.dataset_split (default: test).")
+    ap.add_argument("--fixed-initials", type=str, default=None,
+                    help="Override experiment.fixed_initial_solutions "
+                         "(path relative to tutor_aop/, or absolute, or 'none' to disable).")
+    ap.add_argument("--concurrency", type=int, default=None,
+                    help="Override experiment.concurrency (thread-pool width per stage).")
+    ap.add_argument("--out", type=str, default=None,
+                    help="Override log file path. Default: logs/aop_<tutor>.jsonl")
+    ap.add_argument("--tag", type=str, default=None,
+                    help="Extra tag appended to default log filename.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -325,50 +193,96 @@ def main():
         cfg["experiment"]["num_problems"] = args.num
     if args.start is not None:
         cfg["experiment"]["start_index"] = args.start
+    if args.dataset is not None:
+        cfg["experiment"]["dataset"] = args.dataset
+    if args.dataset_split is not None:
+        cfg["experiment"]["dataset_split"] = args.dataset_split
+    if args.fixed_initials is not None:
+        if args.fixed_initials.lower() == "none":
+            cfg["experiment"]["fixed_initial_solutions"] = None
+        else:
+            p = args.fixed_initials
+            if not os.path.isabs(p):
+                p = os.path.join(HERE, p)
+            cfg["experiment"]["fixed_initial_solutions"] = p
+    if args.tutor_model is not None:
+        cfg["tutor_server"]["model"] = args.tutor_model
+    if args.student_model is not None:
+        cfg["student_server"]["model"] = args.student_model
+    if args.concurrency is not None:
+        cfg["experiment"]["concurrency"] = args.concurrency
 
     log_dir = cfg["logging"]["log_dir"]
     os.makedirs(log_dir, exist_ok=True)
-    log_path = args.out or os.path.join(log_dir, cfg["logging"]["log_filename"])
+
+    tutor_slug = _slugify_model(cfg["tutor_server"]["model"])
+    default_name = f"aop_{tutor_slug}"
+    if args.tag:
+        default_name += f"_{args.tag}"
+    default_name += ".jsonl"
+    log_path = args.out or os.path.join(log_dir, default_name)
 
     data = load_dataset(cfg, mock=cfg.get("mock", {}).get("enabled", False))
+
+    fixed_initials = None
+    fixed_path = cfg["experiment"].get("fixed_initial_solutions")
+    if fixed_path:
+        fixed_initials = load_fixed_initials(fixed_path)
+        print(
+            f"[aop] fixed_initial_solutions: {fixed_path} "
+            f"({len(fixed_initials)} entries) -- skipping live initial_solve",
+            file=sys.stderr,
+        )
+
     pipe = build_pipeline(cfg)
 
-    print(f"[runner] problems={len(data)}  log={log_path}  mock={cfg.get('mock',{}).get('enabled', False)}",
-          file=sys.stderr)
-
-    n_correct_initial = 0
-    n_correct_post = 0
-    n_tutored = 0
+    exp = cfg["experiment"]
+    print(
+        f"[aop] tutor={cfg['tutor_server']['model']}  "
+        f"student={cfg['student_server']['model']}",
+        file=sys.stderr,
+    )
+    print(
+        f"[aop] problems={len(data)}  log={log_path}  "
+        f"mock={cfg.get('mock', {}).get('enabled', False)}  "
+        f"concurrency={exp.get('concurrency', 32)}",
+        file=sys.stderr,
+    )
 
     try:
-        with open(log_path, "a", encoding="utf-8") as fout:
-            for row in tqdm(data, file=sys.stderr):
-                t0 = time.time()
-                try:
-                    episode = run_episode(row, pipe, cfg)
-                except Exception as e:
-                    episode = {
-                        "index": row.get("index"),
-                        "problem": row.get("problem"),
-                        "gold_answer": row.get("answer"),
-                        "fatal_error": f"{type(e).__name__}: {e}",
-                        "traceback": traceback.format_exc(),
-                    }
-                episode["elapsed_sec"] = round(time.time() - t0, 3)
-                fout.write(json.dumps(episode, ensure_ascii=False) + "\n")
-                fout.flush()
+        t_all = time.time()
+        convs = run_aop_batch(
+            rows=data,
+            pipe=pipe,
+            cfg=cfg,
+            fixed_initials=fixed_initials,
+        )
+        elapsed_all = time.time() - t_all
 
-                if episode.get("initial_grade", {}).get("correct"):
+        tutor_model = cfg["tutor_server"]["model"]
+        student_model = cfg["student_server"]["model"]
+
+        n_correct_initial = 0
+        n_tutored = 0
+        n_correct_post = 0
+        with open(log_path, "a", encoding="utf-8") as fout:
+            for c in convs:
+                row_out = aop_conv_to_log_row(c, tutor_model, student_model)
+                fout.write(json.dumps(row_out, ensure_ascii=False) + "\n")
+                if (c.initial_grade or {}).get("correct"):
                     n_correct_initial += 1
-                if episode.get("tutoring_needed"):
+                if c.tutoring_needed:
                     n_tutored += 1
-                    if episode.get("post_tutoring_grade", {}).get("correct"):
+                    if (c.post_tutoring_grade or {}).get("correct"):
                         n_correct_post += 1
 
-        total = len(data)
-        print(f"[runner] DONE  total={total}  initial_correct={n_correct_initial}  "
-              f"tutored={n_tutored}  post_tutoring_correct={n_correct_post}",
-              file=sys.stderr)
+        total = len(convs)
+        print(
+            f"[aop] DONE  total={total}  initial_correct={n_correct_initial}  "
+            f"tutored={n_tutored}  post_tutoring_correct={n_correct_post}  "
+            f"wall={elapsed_all:.1f}s",
+            file=sys.stderr,
+        )
     finally:
         mgr = pipe.get("vllm_manager")
         if mgr is not None:

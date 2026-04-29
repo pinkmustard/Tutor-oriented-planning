@@ -1,8 +1,32 @@
-"""Meta-Tutor: agenda generation, replan, final response, revision."""
+"""Meta-Tutor: agenda generation, replan, final response, revision.
+
+Design choices:
+
+* Planning calls (``plan_agenda``, ``replan``) emit JSON. Their input is a
+  flat-text rendered dialogue inside a single user message -- fine for JSON
+  output workloads, and the prompts are tight.
+
+* The actual student-facing utterance generation (``generate_final``,
+  ``revise_final``) uses **proper multi-turn chat** with perspective rotation
+  (student -> ``user``, tutor -> ``assistant``), mirroring baseline_tutor.
+  Older Qwen-family checkpoints degrade noticeably when long prior dialogue
+  is dumped as flat text inside one user message; running the same content
+  as natural chat turns keeps the chat template happy and prevents the model
+  from drifting into "let me solve the whole problem" mode.
+
+* Worker findings (diagnosis / tutor_move) are summarised into a compact
+  label-form string and included only inside the final user-role nudge --
+  not as a JSON dump in the dialogue context -- so verbose LaTeX-quoted
+  diagnosis fields can't leak into the visible reply.
+
+* ``generate_final`` / ``revise_final`` use ``tutor_turn_max_tokens`` (small,
+  matches baseline). All other meta-tutor calls keep ``max_tokens`` because
+  they emit JSON and need headroom.
+"""
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import List, Dict
 
 from .utils import safe_json_loads, render_dialogue
 from .prompts.meta_tutor_prompts import (
@@ -11,9 +35,8 @@ from .prompts.meta_tutor_prompts import (
     META_TUTOR_REPLAN_SYSTEM,
     META_TUTOR_REPLAN_USER,
     META_TUTOR_FINAL_SYSTEM,
-    META_TUTOR_FINAL_USER,
-    META_TUTOR_REVISE_SYSTEM,
-    META_TUTOR_REVISE_USER,
+    META_TUTOR_FINAL_NUDGE,
+    META_TUTOR_REVISE_NUDGE,
 )
 
 
@@ -57,11 +80,51 @@ def _sanitize_agenda(obj) -> dict:
     return {"agenda": clean}
 
 
+def _dialogue_as_tutor_chat(dialogue: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Perspective-rotate a neutral dialogue for the tutor model.
+
+    Student utterances -> ``user``; tutor utterances -> ``assistant``.
+    Unknown roles are silently skipped.
+    """
+    msgs: List[Dict[str, str]] = []
+    for d in dialogue:
+        role = d.get("role")
+        content = d.get("content", "")
+        if role == "student":
+            msgs.append({"role": "user", "content": content})
+        elif role == "tutor":
+            msgs.append({"role": "assistant", "content": content})
+    return msgs
+
+
+VALID_MOVES = {"Focus", "Probing", "Telling", "Generic"}
+
+
+def _selected_move(worker_outputs: dict) -> str:
+    """Extract just the tutor move name. Diagnosis details / misconception
+    strings are intentionally NOT surfaced to ``generate_final`` -- with
+    Qwen2.5-7B they prompted the model to demonstrate the diagnosis rather
+    than scaffold. The dialogue is enough context to see the student's
+    error.
+    """
+    move = ((worker_outputs.get("tutor_move") or {}).get("selected_move") or "").strip()
+    return move if move in VALID_MOVES else "Probing"
+
+
 class MetaTutor:
-    def __init__(self, client, temperature: float = 0.0, max_tokens: int = 1024):
+    def __init__(
+        self,
+        client,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        tutor_turn_max_tokens: int = 320,
+    ):
         self.client = client
         self.temperature = temperature
+        # JSON-emitting calls (plan_agenda, replan)
         self.max_tokens = max_tokens
+        # Student-facing utterance calls (generate_final, revise_final)
+        self.tutor_turn_max_tokens = tutor_turn_max_tokens
 
     def plan_agenda(
         self,
@@ -115,19 +178,24 @@ class MetaTutor:
         dialogue: list,
         worker_outputs: dict,
     ) -> str:
-        messages = [
-            {"role": "system", "content": META_TUTOR_FINAL_SYSTEM},
-            {"role": "user", "content": META_TUTOR_FINAL_USER.format(
-                problem=problem,
-                dialogue=render_dialogue(dialogue) or "(empty)",
-                worker_outputs=json.dumps(
-                    {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
-                     for k, v in worker_outputs.items()},
-                    ensure_ascii=False,
-                ),
-            )},
+        # System carries the role + the problem; dialogue history is passed as
+        # real chat messages (perspective rotation); a single final user-role
+        # nudge appended to the end carries worker findings + brevity reminder.
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": META_TUTOR_FINAL_SYSTEM.format(problem=problem)},
         ]
-        raw = self.client.chat(messages, temperature=self.temperature, max_tokens=self.max_tokens)
+        messages.extend(_dialogue_as_tutor_chat(dialogue))
+        messages.append({
+            "role": "user",
+            "content": META_TUTOR_FINAL_NUDGE.format(
+                selected_move=_selected_move(worker_outputs),
+            ),
+        })
+        raw = self.client.chat(
+            messages,
+            temperature=self.temperature,
+            max_tokens=self.tutor_turn_max_tokens,
+        )
         return (raw or "").strip()
 
     def revise_final(
@@ -138,20 +206,25 @@ class MetaTutor:
         draft: str,
         auditor_feedback: dict,
     ) -> str:
+        # Same system + perspective-rotated dialogue as generate_final.
+        # The draft is NOT added to the dialogue (it never reached the
+        # student); it goes into the revise nudge.
         fb = {k: v for k, v in auditor_feedback.items() if not k.startswith("_")}
-        messages = [
-            {"role": "system", "content": META_TUTOR_REVISE_SYSTEM},
-            {"role": "user", "content": META_TUTOR_REVISE_USER.format(
-                problem=problem,
-                dialogue=render_dialogue(dialogue) or "(empty)",
-                worker_outputs=json.dumps(
-                    {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
-                     for k, v in worker_outputs.items()},
-                    ensure_ascii=False,
-                ),
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": META_TUTOR_FINAL_SYSTEM.format(problem=problem)},
+        ]
+        messages.extend(_dialogue_as_tutor_chat(dialogue))
+        messages.append({
+            "role": "user",
+            "content": META_TUTOR_REVISE_NUDGE.format(
                 draft=draft,
                 auditor_feedback=json.dumps(fb, ensure_ascii=False),
-            )},
-        ]
-        raw = self.client.chat(messages, temperature=self.temperature, max_tokens=self.max_tokens)
+                selected_move=_selected_move(worker_outputs),
+            ),
+        })
+        raw = self.client.chat(
+            messages,
+            temperature=self.temperature,
+            max_tokens=self.tutor_turn_max_tokens,
+        )
         return (raw or "").strip()

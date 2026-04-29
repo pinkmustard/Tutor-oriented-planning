@@ -37,7 +37,14 @@ import yaml
 from .llm_client import build_clients_from_config
 from .baseline_tutor import BaselineTutor
 from .student import StudentAgent
-from .classroom import run_baseline_batch, conv_to_log_row
+from .classroom import run_baseline_batch, conv_to_log_row, load_fixed_initials
+from .prompts.baseline_tutor_prompts import (
+    BASELINE_TUTOR_SYSTEM,
+    BASELINE_TUTOR_RESPOND_NUDGE,
+    TUTORRL_THINK_SYSTEM,
+    TUTORRL_THINK_NUDGE,
+    THINK_TUTOR_MODELS,
+)
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -49,11 +56,22 @@ def load_config(path: str) -> dict:
     log_dir = cfg.get("logging", {}).get("log_dir", "logs")
     if log_dir and not os.path.isabs(log_dir):
         cfg["logging"]["log_dir"] = os.path.join(HERE, log_dir)
+    fixed = cfg.get("experiment", {}).get("fixed_initial_solutions")
+    if fixed and not os.path.isabs(fixed):
+        cfg["experiment"]["fixed_initial_solutions"] = os.path.join(HERE, fixed)
     return cfg
 
 
 def load_dataset(cfg: dict, mock: bool) -> list:
+    """Load problems from the configured HF dataset/split.
+
+    Field map: ``problem``, ``answer`` are required; ``solution``, ``level``,
+    ``subject`` are taken if present (MATH-500), else None (Big-Math-RL-
+    Verified-Filtered has no ``solution``/``level``/``subject`` -- only
+    ``problem``, ``answer``, ``source``, ``domain``, ``llama8b_solve_rate``).
+    """
     name = cfg["experiment"]["dataset"]
+    split = cfg["experiment"].get("dataset_split", "test")
     num = cfg["experiment"]["num_problems"]
     start = cfg["experiment"].get("start_index", 0)
 
@@ -65,6 +83,7 @@ def load_dataset(cfg: dict, mock: bool) -> list:
                 "answer": "3",
                 "level": "Level 1",
                 "subject": "Algebra",
+                "index": 0,
             },
             {
                 "problem": "Find the area of a right triangle with legs 3 and 4.",
@@ -72,12 +91,13 @@ def load_dataset(cfg: dict, mock: bool) -> list:
                 "answer": "6",
                 "level": "Level 1",
                 "subject": "Geometry",
+                "index": 1,
             },
         ]
         return base[: max(1, num)]
 
     from datasets import load_dataset as hf_load_dataset
-    ds = hf_load_dataset(name, split="test")
+    ds = hf_load_dataset(name, split=split)
     end = min(start + num, len(ds))
     out = []
     for i in range(start, end):
@@ -88,6 +108,11 @@ def load_dataset(cfg: dict, mock: bool) -> list:
             "answer": row.get("answer"),
             "level": row.get("level"),
             "subject": row.get("subject"),
+            # Datasets without canonical level/subject fields may still carry
+            # auxiliary context like Big-Math's `source`/`domain` -- keep them
+            # for downstream slicing if present.
+            "source": row.get("source"),
+            "domain": row.get("domain"),
             "index": i,
         })
     return out
@@ -107,6 +132,13 @@ def main():
     ap.add_argument("--tutor-model", type=str, default=None,
                     help="Override tutor_server.model (e.g. CogBase-USTC/SocraticLM).")
     ap.add_argument("--student-model", type=str, default=None)
+    ap.add_argument("--dataset", type=str, default=None,
+                    help="Override experiment.dataset (HF dataset name).")
+    ap.add_argument("--dataset-split", type=str, default=None,
+                    help="Override experiment.dataset_split (default: test).")
+    ap.add_argument("--fixed-initials", type=str, default=None,
+                    help="Override experiment.fixed_initial_solutions "
+                         "(path relative to tutor_aop/, or absolute, or 'none' to disable).")
     ap.add_argument("--concurrency", type=int, default=None,
                     help="Override experiment.concurrency (thread-pool width).")
     ap.add_argument("--out", type=str, default=None,
@@ -122,6 +154,18 @@ def main():
         cfg["experiment"]["num_problems"] = args.num
     if args.start is not None:
         cfg["experiment"]["start_index"] = args.start
+    if args.dataset is not None:
+        cfg["experiment"]["dataset"] = args.dataset
+    if args.dataset_split is not None:
+        cfg["experiment"]["dataset_split"] = args.dataset_split
+    if args.fixed_initials is not None:
+        if args.fixed_initials.lower() == "none":
+            cfg["experiment"]["fixed_initial_solutions"] = None
+        else:
+            p = args.fixed_initials
+            if not os.path.isabs(p):
+                p = os.path.join(HERE, p)
+            cfg["experiment"]["fixed_initial_solutions"] = p
     if args.tutor_model is not None:
         cfg["tutor_server"]["model"] = args.tutor_model
     if args.student_model is not None:
@@ -141,19 +185,44 @@ def main():
 
     data = load_dataset(cfg, mock=cfg.get("mock", {}).get("enabled", False))
 
+    fixed_initials = None
+    fixed_path = cfg["experiment"].get("fixed_initial_solutions")
+    if fixed_path:
+        fixed_initials = load_fixed_initials(fixed_path)
+        print(
+            f"[baseline] fixed_initial_solutions: {fixed_path} "
+            f"({len(fixed_initials)} entries) -- skipping live initial_solve",
+            file=sys.stderr,
+        )
+
     tutor_client, student_client, vllm_manager = build_clients_from_config(cfg)
 
     exp = cfg["experiment"]
+    tutor_model = cfg["tutor_server"]["model"]
+    if tutor_model in THINK_TUTOR_MODELS:
+        tutor_system = TUTORRL_THINK_SYSTEM
+        tutor_nudge = TUTORRL_THINK_NUDGE
+        print(
+            f"[baseline] tutor model {tutor_model!r} matches THINK_TUTOR_MODELS "
+            f"-- using <think>-aware system + nudge",
+            file=sys.stderr,
+        )
+    else:
+        tutor_system = BASELINE_TUTOR_SYSTEM
+        tutor_nudge = BASELINE_TUTOR_RESPOND_NUDGE
     tutor = BaselineTutor(
         client=tutor_client,
+        system_prompt=tutor_system,
+        respond_nudge=tutor_nudge,
         temperature=exp["temperature"],
-        max_tokens=exp["max_tokens"],
+        max_tokens=exp["tutor_turn_max_tokens"],
     )
     student = StudentAgent(
         client=student_client,
         temperature=exp.get("student_temperature", 0.7),
-        max_tokens=exp["max_tokens"],
-        resolve_max_tokens=exp.get("student_resolve_max_tokens"),
+        initial_max_tokens=exp["student_initial_max_tokens"],
+        respond_max_tokens=exp["student_respond_max_tokens"],
+        resolve_max_tokens=exp["student_resolve_max_tokens"],
     )
 
     print(
@@ -175,6 +244,7 @@ def main():
             tutor=tutor,
             student=student,
             cfg=cfg,
+            fixed_initials=fixed_initials,
         )
         elapsed_all = time.time() - t_all
 

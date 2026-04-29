@@ -43,10 +43,20 @@ Respond as a genuine learner:
 - Show your updated reasoning or attempt, briefly.
 - You may still be uncertain or make mistakes.
 - Do not pretend to know things the tutor has not helped you figure out.
-- Keep each reply short (1-4 sentences).
+- BREVITY (HARD): Keep each reply under 40 words; 1-3 sentences. Do NOT redo the entire problem or restate prior turns. Only respond to the tutor's most recent message.
+- Do not repeat reasoning you have already shown in earlier turns.
 - During the dialogue, do NOT finalize with \\boxed{{}} unless the tutor has clearly led you to the full answer.
 
 At the very end of the conversation, the tutor will stop and you will be asked to produce a complete, independent written solution. Save the full \\boxed{{}} answer for that final turn."""
+
+
+# Final user nudge appended after the perspective-rotated dialogue history,
+# right before the student model generates a mid-dialogue reply. Mirrors the
+# "now do X" instruction that initial_solve / independent_resolve already
+# carry, so the model has a clear cue at the END of the prompt about what
+# to produce on this turn -- keeps the brevity constraint visible in late
+# turns and prevents the student from re-doing the whole problem.
+STUDENT_RESPOND_NUDGE = """Now write your short reply to the tutor's most recent message. Stay under 40 words; 1-3 sentences. Do NOT restate prior turns or redo the entire problem. Do NOT include \\boxed{} unless the tutor has clearly led you to the full answer."""
 
 
 STUDENT_FINAL_USER = """The conversation with the tutor has now ended.
