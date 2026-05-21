@@ -3,9 +3,20 @@
 Originally written in Llama-2-Chat raw format ("### System: / ### User: /
 ### Assistant:" markers in a single string). Reformatted here for Qwen2.5 /
 Qwen3 instruction-tuned models that consume an OpenAI-compatible chat-
-completions ``messages`` list. The wording of every task is preserved
-verbatim; only the role markers and the trailing "Assistant:" generation
-seed are restructured.
+completions ``messages`` list.
+
+Tasks 1 and 2 (error inference, strategy / intention selection) preserve
+the original wording verbatim -- only the Llama-2 role markers and the
+trailing "Assistant:" generation seed are restructured.
+
+Task 3 (the student-facing utterance) is intentionally extended beyond
+verbatim to keep the bridge baseline FAIR vs. the single-tutor baseline:
+the single-tutor baseline explicitly frames itself as Socratic and uses
+the ``<end_of_conversation>`` token to end the session when no further
+tutoring is needed; the bridge baseline now does the same, so the two
+baselines share the same tutoring affordances and any post-tutoring
+accuracy difference can be attributed to the bridge architecture rather
+than to a missing stop signal. Tasks 1 and 2 are unaffected.
 
 Each task exposes two constants:
 
@@ -88,12 +99,22 @@ Begin your response with:
 # ---------------------------------------------------------------------------
 # Task 3: generate the tutor's actual utterance
 # ---------------------------------------------------------------------------
-TASK3_GENERATE_RESPONSE_SYSTEM = """You are an experienced elementary math teacher and you are going to respond to a student's mistake in a useful and caring way."""
+TASK3_GENERATE_RESPONSE_SYSTEM = """You are an experienced Socratic math tutor responding to a student's mistake in a useful and caring way. Your goal is to guide the student toward the correct answer through dialogue, not to solve the problem for them.
+
+Socratic Guidelines:
+- Prefer probing questions and focused hints over direct explanation.
+- When a short factual explanation is necessary to unblock the student, keep it to one sentence.
+- Do NOT state the final numeric or symbolic answer directly.
+- Address ONE issue per turn; start from the student's first substantive error.
+- Do not repeat hints or framings you have already given in earlier turns.
+- When you judge that the student has reached the correct answer or can finish on their own, end your message with the literal token <end_of_conversation>. Once this token is emitted, the tutoring session ends and no further tutor turns will be issued."""
 
 TASK3_GENERATE_RESPONSE_USER = """{task1_response}{task2_response}
 Lesson topic: {problem}
 Conversation:
 {c_h}
+
+Now write your next short utterance to the student. Stay under 60 words; address one specific issue or question. Never reveal the final answer. End with <end_of_conversation> only if the student has clearly reached the answer or can finish on their own.
 
 Begin your response with:
 tutor (maximum one sentence):"""

@@ -115,6 +115,22 @@ def _strip_underscores(d):
     return {k: v for k, v in d.items() if not k.startswith("_")}
 
 
+def _strip_end_token(text: str) -> str:
+    """Remove all variants of the <end_of_conversation> token from ``text``.
+
+    Used as a deterministic safety net at turn 0: even if the prompt-level
+    rules and the auditor + revise loop all fail to suppress the token,
+    this strip guarantees no premature termination on the first tutor
+    turn. Mirrors the case-insensitive match in ``utils.contains_end_signal``.
+    """
+    if not text:
+        return ""
+    # Match common variants: with / without spaces, any case.
+    import re
+    cleaned = re.sub(r"<\s*end_of_conversation\s*>", "", text, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
 def _has_worker(agenda: Optional[dict], worker_name: str) -> bool:
     if not agenda:
         return False
@@ -439,6 +455,8 @@ def run_aop_batch(
                     problem=c.row["problem"],
                     dialogue=c.dialogue,
                     worker_outputs=c.curr_worker_outputs,
+                    turn_idx=turn_idx,
+                    max_turns=max_turns,
                 ),
                 final_active,
                 concurrency,
@@ -467,7 +485,10 @@ def run_aop_batch(
                 if isinstance(tm, dict):
                     tutor_move = tm.get("selected_move", "") or ""
                 return auditor.audit(
-                    c.row["problem"], c.curr_draft, tutor_move=tutor_move,
+                    c.row["problem"],
+                    c.curr_draft,
+                    tutor_move=tutor_move,
+                    dialogue=c.dialogue,
                 )
 
             results = _run_parallel(_audit, audit_active, concurrency)
@@ -500,6 +521,8 @@ def run_aop_batch(
                     worker_outputs=c.curr_worker_outputs,
                     draft=c.curr_draft,
                     auditor_feedback=c.curr_audit,
+                    turn_idx=turn_idx,
+                    max_turns=max_turns,
                 ),
                 revise_active,
                 concurrency,
@@ -526,6 +549,19 @@ def run_aop_batch(
                     turn_idx,
                 )
                 continue
+
+            # Hard floor: turn 0 must NEVER end the conversation. The
+            # auditor + revise loop is best-effort; this strips any
+            # leaked <end_of_conversation> token deterministically so
+            # the student always gets to respond at least once. Logged
+            # as ``force_stripped_end_token`` for downstream analysis
+            # of how often the prompt-level safeguards failed.
+            if turn_idx == 0 and contains_end_signal(final):
+                stripped = _strip_end_token(final)
+                tl["force_stripped_end_token"] = True
+                tl["pre_strip_final"] = final
+                final = stripped
+
             tl["final_tutor_response"] = final
             c.dialogue.append({"role": "tutor", "content": final})
             if contains_end_signal(final):

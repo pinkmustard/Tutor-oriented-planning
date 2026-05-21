@@ -44,6 +44,7 @@ Selection heuristic (suggestive, not strict):
 - If the student expressed confusion about WHERE to go next → Focus.
 - If the student is missing a concrete fact or definition that blocks progress → Telling.
 - If the student expressed frustration or asked for reassurance → Generic.
+- If the student's MOST RECENT message contains an explicitly corrected reasoning step or the correct final answer → Generic. This is the natural "Q3 confirmation" of a Socratic Q1 → Q2 → Q3 sequence: a brief confirmation that acknowledges the corrected step and lets the dialogue close cleanly. Vague acknowledgements ("ok", "I see") do NOT qualify; the student must have actually produced a corrected step or correct answer.
 
 Output strictly JSON. JSON only -- no prose before or after. NO LaTeX in
 any field; rationale is short English only.

@@ -177,10 +177,15 @@ class MetaTutor:
         problem: str,
         dialogue: list,
         worker_outputs: dict,
+        turn_idx: int,
+        max_turns: int,
     ) -> str:
         # System carries the role + the problem; dialogue history is passed as
         # real chat messages (perspective rotation); a single final user-role
         # nudge appended to the end carries worker findings + brevity reminder.
+        # turn_idx / max_turns are surfaced into the nudge so the model can
+        # apply the absolute-termination rule (no <end_of_conversation> on
+        # turn 0).
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": META_TUTOR_FINAL_SYSTEM.format(problem=problem)},
         ]
@@ -189,6 +194,8 @@ class MetaTutor:
             "role": "user",
             "content": META_TUTOR_FINAL_NUDGE.format(
                 selected_move=_selected_move(worker_outputs),
+                turn_idx=turn_idx,
+                max_turns=max_turns,
             ),
         })
         raw = self.client.chat(
@@ -205,6 +212,8 @@ class MetaTutor:
         worker_outputs: dict,
         draft: str,
         auditor_feedback: dict,
+        turn_idx: int,
+        max_turns: int,
     ) -> str:
         # Same system + perspective-rotated dialogue as generate_final.
         # The draft is NOT added to the dialogue (it never reached the
@@ -220,6 +229,8 @@ class MetaTutor:
                 draft=draft,
                 auditor_feedback=json.dumps(fb, ensure_ascii=False),
                 selected_move=_selected_move(worker_outputs),
+                turn_idx=turn_idx,
+                max_turns=max_turns,
             ),
         })
         raw = self.client.chat(
